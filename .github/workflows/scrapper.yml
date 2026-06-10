@@ -1,34 +1,35 @@
 name: Run Procurement Scraper
-
 on:
-  workflow_dispatch: # Allows you to run this manually from the Actions tab
+  workflow_dispatch:
 
 jobs:
   scrape-and-save:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - uses: nanasess/setup-chromedriver@v2
+      
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install selenium
-
-      # Selenium 4.10+ automatically handles downloading the correct ChromeDriver, 
-      # and ubuntu-latest already has Chrome installed.
+        run: pip install selenium pandas openpyxl
+        
       - name: Run Scraper
         run: python procurement_scrap_v3.py
-
-      - name: Upload Downloaded Data
+        
+      - name: Convert to CSV
+        run: |
+          python -c "
+          import os, pandas as pd
+          for f in os.listdir('procurement_data'):
+              if f.endswith(('.xlsx', '.xls')):
+                  df = pd.read_excel(os.path.join('procurement_data', f))
+                  df.to_csv(os.path.join('procurement_data', f.rsplit('.', 1)[0] + '.csv'), index=False)
+                  os.remove(os.path.join('procurement_data', f))
+          "
+          
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: procurement-data
           path: procurement_data/
-          retention-days: 7 # How long GitHub will store the zip file
