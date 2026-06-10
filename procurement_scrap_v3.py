@@ -34,12 +34,10 @@ DOWNLOAD_DIR = os.path.abspath("procurement_data")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 EXCLUDE_2026_27 = True
-
-# How many times to retry a failed combination before giving up
 MAX_COMBO_RETRIES = 3
 
 # =========================================
-# DRIVER FACTORY  (re-used on hard resets)
+# DRIVER
 # =========================================
 
 def make_driver() -> webdriver.Chrome:
@@ -61,7 +59,6 @@ def make_driver() -> webdriver.Chrome:
     driver.maximize_window()
     return driver
 
-
 # =========================================
 # HELPERS
 # =========================================
@@ -71,16 +68,11 @@ def sanitize(text: str) -> str:
 
 
 def _read_options(driver, select_id: str) -> list[dict]:
-    """Read all non-placeholder options from a <select> element.
-    Returns [] if the element is disabled or has no meaningful options.
-    Raises StaleElementReferenceException / NoSuchElementException — callers handle.
-    """
     el = driver.find_element(By.ID, select_id)
     if el.get_attribute("disabled") is not None:
         return []
-    sel = Select(el)
     result = []
-    for opt in sel.options:
+    for opt in Select(el).options:
         val = opt.get_attribute("value")
         txt = opt.text.strip()
         if val and val not in ("0", "") and txt:
@@ -89,12 +81,24 @@ def _read_options(driver, select_id: str) -> list[dict]:
 
 
 def _get_selected_value(driver, select_id: str) -> str | None:
-    """Return currently selected value, or None on any DOM error."""
     try:
         el = driver.find_element(By.ID, select_id)
         return Select(el).first_selected_option.get_attribute("value")
     except Exception:
         return None
+
+
+def wait_for_dropdown_to_clear(driver, select_id: str, timeout: float = 8) -> bool:
+    """Wait until dropdown has zero meaningful options (Angular cleared it)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if not _read_options(driver, select_id):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.15)
+    return False
 
 
 def wait_for_dropdown_options(
@@ -105,21 +109,14 @@ def wait_for_dropdown_options(
     check_no_data_warning: bool = False,
 ) -> list[dict]:
     """
-    Waits until the dropdown options list has *stabilised* (identical across
-    `stable_rounds` consecutive 200 ms reads).
-
-    If `check_no_data_warning=True`, also watches for Angular warning messages
-    that indicate no data exists for this combination.
-
-    Returns a list of option dicts, or [] if the dropdown is empty / disabled /
-    a no-data warning fires.
+    Wait until dropdown options stabilise across `stable_rounds` consecutive
+    0.2s reads. Also checks Angular's ".missing_field" warning if requested.
     """
-    end_time = time.time() + timeout
-    last_snapshot: list[dict] | None = None
-    stable_count = 0
+    end = time.time() + timeout
+    last: list[dict] | None = None
+    hits = 0
 
-    while time.time() < end_time:
-        # ── Check for Angular "no records" warning ──────────────────────────
+    while time.time() < end:
         if check_no_data_warning:
             try:
                 for w in driver.find_elements(By.CSS_SELECTOR, ".missing_field"):
@@ -128,46 +125,23 @@ def wait_for_dropdown_options(
             except Exception:
                 pass
 
-        # ── Read current options ─────────────────────────────────────────────
         try:
-            snapshot = _read_options(driver, select_id)
+            snap = _read_options(driver, select_id)
         except (StaleElementReferenceException, NoSuchElementException):
-            last_snapshot = None
-            stable_count = 0
+            last, hits = None, 0
             time.sleep(0.2)
             continue
 
-        # ── Stability check ──────────────────────────────────────────────────
-        if snapshot and snapshot == last_snapshot:
-            stable_count += 1
-            if stable_count >= stable_rounds:
-                return snapshot
+        if snap and snap == last:
+            hits += 1
+            if hits >= stable_rounds:
+                return snap
         else:
-            last_snapshot = snapshot
-            stable_count = 0
+            last, hits = snap, 0
 
         time.sleep(0.2)
 
-    # Timeout: return whatever we last saw (may be [])
-    return last_snapshot if last_snapshot else []
-
-
-def wait_for_dropdown_to_clear(driver, select_id: str, timeout: float = 8) -> bool:
-    """
-    Waits until the dropdown has 0 meaningful options (i.e. Angular has cleared
-    it in preparation for repopulating after a parent change).
-    Returns True when cleared, False on timeout.
-    """
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        try:
-            opts = _read_options(driver, select_id)
-            if not opts:
-                return True
-        except Exception:
-            pass
-        time.sleep(0.15)
-    return False
+    return last if last else []
 
 
 def robust_select(
@@ -178,88 +152,88 @@ def robust_select(
     timeout: float = 15,
 ) -> bool:
     """
-    Selects `value` in `select_id` with full reliability:
-      1. Waits for the element to be clickable.
-      2. Selects the value.
-      3. Verifies the selection actually stuck (Angular can reset it).
-      4. If `downstream_id` provided, waits for that dropdown to clear first
-         (proving Angular registered the change) before returning.
-
-    Returns True on success, False if selection couldn't be confirmed.
+    Select `value` in `select_id`, confirm it stuck, then optionally wait for
+    `downstream_id` to clear (proving Angular registered the change).
     """
-    end_time = time.time() + timeout
-    while time.time() < end_time:
+    end = time.time() + timeout
+    while time.time() < end:
         try:
             el = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.ID, select_id))
             )
             Select(el).select_by_value(value)
-
-            # ── Confirm it stuck ────────────────────────────────────────────
             time.sleep(0.15)
-            chosen = _get_selected_value(driver, select_id)
-            if chosen != value:
+            if _get_selected_value(driver, select_id) != value:
                 time.sleep(0.3)
-                continue  # Angular reset it; retry
-
-            # ── Wait for downstream to clear (proves change was registered) ─
+                continue
             if downstream_id:
                 wait_for_dropdown_to_clear(driver, downstream_id, timeout=5)
-
             return True
-
         except (StaleElementReferenceException, ElementNotInteractableException):
             time.sleep(0.3)
         except Exception:
             time.sleep(0.3)
-
     return False
 
 
-def wait_for_fresh_table(driver, timeout: float = 35) -> str:
+def _get_result_signature(driver) -> str:
     """
-    Waits for the results area to update *after* clicking Submit.
-    Strategy: snapshot table row count *before* submit is called (caller
-    passes driver immediately after click), then wait for it to change.
-
-    Returns: "ok" | "no_data" | "timeout"
+    Returns a string that uniquely identifies the currently displayed result.
+    Built from the result metadata band shown above the table:
+      'Marketing Season : KMS  Marketing Year : 2025-2026  Commodity : Paddy  ...'
+    Plus the State label shown in the results section.
+    This lets us confirm the table belongs to the combo we just submitted.
     """
-    end_time = time.time() + timeout
-    while time.time() < end_time:
-        # Check error alert
-        try:
-            for alert in driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg"):
-                if alert.is_displayed() and "no records found" in alert.text.lower():
-                    return "no_data"
-        except Exception:
-            pass
-
-        # Check populated table
-        try:
-            rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-            if rows and len(rows) > 0 and rows[0].text.strip():
-                return "ok"
-        except Exception:
-            pass
-
-        time.sleep(0.25)
-    return "timeout"
-
-
-def click_submit_get_result(driver) -> str:
-    """Clears previous table, clicks submit, waits for fresh result."""
-    # Wipe table body so we don't read stale rows
     try:
-        driver.execute_script(
-            "const tb = document.querySelector('table tbody'); if (tb) tb.innerHTML = '';"
+        # Grab the "to-bg mb-2" div that shows Season/Year/Commodity/CropType
+        meta_els = driver.find_elements(By.CSS_SELECTOR, ".table-warp .to-bg .col-md-3")
+        meta = " | ".join(e.text.strip() for e in meta_els if e.text.strip())
+
+        # Grab the State label from the results section (col with "State :")
+        state_els = driver.find_elements(
+            By.CSS_SELECTOR, ".table-warp .row.mb-2 .col-sm-12.col-md-4.col-lg-6"
         )
-        # Also remove stale alerts
-        driver.execute_script(
-            "document.querySelectorAll('.alert-danger-msg').forEach(e => e.remove());"
-        )
+        state_txt = " | ".join(e.text.strip() for e in state_els if e.text.strip())
+
+        return f"{meta} || {state_txt}"
+    except Exception:
+        return ""
+
+
+def _table_has_data_rows(driver) -> bool:
+    """
+    True only if tbody contains at least one real data row.
+    Explicitly ignores tfoot (Grand Total) to prevent false positives.
+    """
+    try:
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+        for row in rows:
+            cells = row.find_elements(By.TAG_NAME, "td")
+            if len(cells) >= 2 and cells[1].text.strip():
+                return True
     except Exception:
         pass
+    return False
 
+
+def click_submit_get_result(driver, expected_combo_label: str, timeout: float = 45) -> str:
+    """
+    Submits the form and waits for a FRESH result that matches `expected_combo_label`.
+
+    The label is built from (season_text, year_text, commodity_text, crop_text, state_text)
+    and compared against the metadata band Angular renders above the table.
+
+    Returns: "ok" | "no_data" | "timeout"
+
+    FIX: We no longer wipe tbody via JS (breaks Angular). Instead we:
+      1. Record the pre-submit result signature.
+      2. Click submit.
+      3. Wait for the signature to CHANGE — this is the true "fresh result" gate.
+      4. Then confirm tbody has actual data rows (not just tfoot).
+    """
+    pre_sig = _get_result_signature(driver)
+
+    # Click submit
     try:
         btn = WebDriverWait(driver, 15).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
@@ -268,16 +242,43 @@ def click_submit_get_result(driver) -> str:
     except Exception as e:
         return f"submit_error:{e}"
 
-    return wait_for_fresh_table(driver)
+    end = time.time() + timeout
+    while time.time() < end:
+        # Check for Angular no-data alert
+        try:
+            for alert in driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg"):
+                if alert.is_displayed() and "no records found" in alert.text.lower():
+                    return "no_data"
+        except Exception:
+            pass
+
+        # Check if result signature changed from pre-submit state
+        try:
+            current_sig = _get_result_signature(driver)
+            if current_sig and current_sig != pre_sig:
+                # Signature changed — verify it's for our exact combo
+                if expected_combo_label.lower() in current_sig.lower():
+                    # Confirm tbody actually has data rows (not just tfoot)
+                    if _table_has_data_rows(driver):
+                        return "ok"
+                    else:
+                        # Sig changed but no rows yet — keep waiting
+                        pass
+                else:
+                    # Sig changed but to wrong combo — page state mismatch
+                    log.warning(f"    [sig mismatch] expected: {expected_combo_label!r}, got: {current_sig!r}")
+                    return "sig_mismatch"
+        except Exception:
+            pass
+
+        time.sleep(0.25)
+
+    return "timeout"
 
 
 def wait_for_download(directory: str, before: set, timeout: int = 90) -> str | None:
-    """
-    Waits for a new non-partial file to appear.
-    Handles .crdownload partial files and retries until clean.
-    """
-    end_time = time.time() + timeout
-    while time.time() < end_time:
+    end = time.time() + timeout
+    while time.time() < end:
         current = set(os.listdir(directory))
         new_files = [
             f for f in (current - before)
@@ -292,7 +293,6 @@ def wait_for_download(directory: str, before: set, timeout: int = 90) -> str | N
 
 
 def reload_and_wait(driver) -> bool:
-    """Hard-reload the page and wait for the first dropdown to be ready."""
     try:
         driver.get(URL)
         WebDriverWait(driver, 30).until(
@@ -303,8 +303,17 @@ def reload_and_wait(driver) -> bool:
         return False
 
 
+def navigate_to_crop(driver, season, year, commodity, crop) -> bool:
+    """Full navigation from season → crop with downstream-clear gates at each step."""
+    return (
+        robust_select(driver, "m_s_id",    season["value"],    downstream_id="m_year")
+        and robust_select(driver, "m_year",    year["value"],      downstream_id="comdty_id")
+        and robust_select(driver, "comdty_id", commodity["value"], downstream_id="c_type_id")
+        and robust_select(driver, "c_type_id", crop["value"],      downstream_id="st_id")
+    )
+
 # =========================================
-# COMBO PROCESSOR (single attempt)
+# COMBO PROCESSOR
 # =========================================
 
 def process_combination(
@@ -316,57 +325,33 @@ def process_combination(
     state: dict,
     already_done: set,
 ) -> str:
-    """
-    Executes one full season/year/commodity/crop/state combination.
-
-    Returns one of:
-      "saved"   – file downloaded and renamed
-      "skipped" – already in already_done set
-      "no_data" – server returned no records
-      "timeout" – page failed to respond
-      "error:<msg>" – any other exception
-    """
     fname = sanitize(
         f"{season['text']}_{year['text']}_{commodity['text']}_{crop['text']}_{state['text']}"
     )
     if fname in already_done:
         return "skipped"
 
-    # ── Season ───────────────────────────────────────────────────────────────
-    if not robust_select(driver, "m_s_id", season["value"], downstream_id="m_year"):
-        return "error:season select failed"
-
-    # ── Year ─────────────────────────────────────────────────────────────────
-    if not robust_select(driver, "m_year", year["value"], downstream_id="comdty_id"):
-        return "error:year select failed"
-
-    # ── Commodity ────────────────────────────────────────────────────────────
-    if not robust_select(driver, "comdty_id", commodity["value"], downstream_id="c_type_id"):
-        return "error:commodity select failed"
-
-    # ── Crop type ────────────────────────────────────────────────────────────
-    if not robust_select(driver, "c_type_id", crop["value"], downstream_id="st_id"):
-        return "error:crop select failed"
-
-    # ── State ────────────────────────────────────────────────────────────────
-    # The state dropdown is the most volatile: it repopulates on every
-    # crop-type change.  We must confirm the OPTIONS still include our target
-    # value before selecting, because Angular may have re-rendered the list.
+    # Confirm state option still present after prior navigation
     states_now = wait_for_dropdown_options(driver, "st_id", timeout=12, stable_rounds=3)
     if not any(s["value"] == state["value"] for s in states_now):
-        return "error:state option disappeared after crop select"
+        return "error:state option disappeared"
 
     if not robust_select(driver, "st_id", state["value"]):
         return "error:state select failed"
 
-    # ── Submit ────────────────────────────────────────────────────────────────
-    status = click_submit_get_result(driver)
+    # Build a matchable label from the metadata Angular will render
+    # The page shows:  "Marketing Season : KMS  Marketing Year : 2025-2026
+    #                   Commodity : Paddy  Crop Type : Kharif"  + "State : ASSAM"
+    expected_label = state["text"]   # matching just the state name is sufficient & robust
+
+    status = click_submit_get_result(driver, expected_label)
+
     if status == "no_data":
         return "no_data"
     if status != "ok":
         return f"timeout_or_error:{status}"
 
-    # ── Download ─────────────────────────────────────────────────────────────
+    # Download
     before = set(os.listdir(DOWNLOAD_DIR))
     try:
         xl_btn = WebDriverWait(driver, 15).until(
@@ -376,7 +361,7 @@ def process_combination(
         )
         driver.execute_script("arguments[0].click();", xl_btn)
     except Exception as e:
-        return f"error:excel button not found: {e}"
+        return f"error:excel button: {e}"
 
     downloaded = wait_for_download(DOWNLOAD_DIR, before)
     if not downloaded:
@@ -389,7 +374,6 @@ def process_combination(
     os.rename(downloaded, target)
     already_done.add(fname)
     return "saved"
-
 
 # =========================================
 # MAIN ENGINE
@@ -420,7 +404,7 @@ def main():
     total_saved = total_skipped = total_no_data = total_errors = 0
 
     log.info("=" * 60)
-    log.info("  Procurement Scraper — Hardened Build")
+    log.info("  Procurement Scraper — v4 (Signature-Verified Table Build)")
     log.info(f"  Destination : {DOWNLOAD_DIR}")
     log.info(f"  Already done: {len(already_done)} files")
     log.info("=" * 60)
@@ -436,37 +420,31 @@ def main():
             for year in MARKETING_YEARS:
                 log.info(f"\n► {season['text']}  {year['text']}")
 
-                # ── Navigate to this season/year ──────────────────────────────
-                # Always reload to get a clean Angular state at the top of
-                # each year block — avoids cascading stale-state bugs.
                 if not reload_and_wait(driver):
-                    log.warning("  Page reload failed, skipping this year block.")
+                    log.warning("  Page reload failed; skipping year block.")
                     total_errors += 1
                     continue
 
                 if not robust_select(driver, "m_s_id", season["value"], downstream_id="m_year"):
-                    log.warning("  Season select failed, skipping.")
+                    log.warning("  Season select failed; skipping.")
                     total_errors += 1
                     continue
-
                 if not robust_select(driver, "m_year", year["value"], downstream_id="comdty_id"):
-                    log.warning("  Year select failed, skipping.")
+                    log.warning("  Year select failed; skipping.")
                     total_errors += 1
                     continue
 
                 commodities = wait_for_dropdown_options(driver, "comdty_id", timeout=12)
                 if not commodities:
-                    log.info("  (No commodities available)")
+                    log.info("  (No commodities)")
                     continue
                 log.info(f"  {len(commodities)} commodities")
 
                 for commodity in commodities:
                     log.info(f"  ┌─ {commodity['text']}")
 
-                    # Re-select season/year/commodity fresh each time to avoid
-                    # Angular losing track after prior iterations.
                     if not reload_and_wait(driver):
-                        log.warning("  │  Reload failed before commodity. Skipping.")
+                        log.warning("  │  Reload failed; skipping commodity.")
                         total_errors += 1
                         continue
 
@@ -491,53 +469,42 @@ def main():
                     for crop in crop_types:
                         log.info(f"  │  ├─ {crop['text']}")
 
-                        # Select crop type; downstream = st_id clears first
                         if not robust_select(driver, "c_type_id", crop["value"], downstream_id="st_id"):
-                            log.warning("  │  │  Crop select failed. Skipping.")
+                            log.warning("  │  │  Crop select failed.")
                             total_errors += 1
                             continue
 
-                        # Read state list ONCE for this crop (stable)
                         states = wait_for_dropdown_options(
                             driver, "st_id",
-                            timeout=12,
-                            stable_rounds=3,
+                            timeout=12, stable_rounds=3,
                             check_no_data_warning=True,
                         )
                         if not states:
-                            log.info("  │  │  └─ (No states for this combination)")
+                            log.info("  │  │  └─ (No states)")
                             total_no_data += 1
                             continue
-
                         log.info(f"  │  │   {len(states)} states")
 
                         for state in states:
                             label = f"  │  │  ├─ {state['text']}"
-
-                            # ── Per-combo retry loop ──────────────────────────
                             result = "error:not_attempted"
+
                             for attempt in range(1, MAX_COMBO_RETRIES + 1):
                                 if attempt > 1:
                                     log.info(f"  │  │  │  (retry {attempt}/{MAX_COMBO_RETRIES})")
-                                    # On retry: reload and re-navigate to this crop
+                                    # Full reload + re-navigation to this crop on retry
                                     if not reload_and_wait(driver):
-                                        result = "error:reload failed on retry"
+                                        result = "error:reload failed"
                                         break
-                                    ok = (
-                                        robust_select(driver, "m_s_id", season["value"], downstream_id="m_year")
-                                        and robust_select(driver, "m_year", year["value"], downstream_id="comdty_id")
-                                        and robust_select(driver, "comdty_id", commodity["value"], downstream_id="c_type_id")
-                                        and robust_select(driver, "c_type_id", crop["value"], downstream_id="st_id")
-                                    )
-                                    if not ok:
+                                    if not navigate_to_crop(driver, season, year, commodity, crop):
                                         result = "error:navigation failed on retry"
                                         break
-                                    # Re-read state list after re-navigation
-                                    states_retry = wait_for_dropdown_options(
+                                    # Re-verify state still exists after re-navigation
+                                    retry_states = wait_for_dropdown_options(
                                         driver, "st_id", timeout=12, stable_rounds=3
                                     )
-                                    if not any(s["value"] == state["value"] for s in states_retry):
-                                        result = "error:state gone after retry navigation"
+                                    if not any(s["value"] == state["value"] for s in retry_states):
+                                        result = "error:state gone after retry nav"
                                         break
 
                                 result = process_combination(
@@ -545,12 +512,10 @@ def main():
                                 )
 
                                 if result in ("saved", "skipped", "no_data"):
-                                    break  # Success — no need to retry
-                                if result.startswith("error:state option disappeared"):
-                                    break  # State truly not available; no point retrying
-                                # Any other error: loop to retry
+                                    break
+                                if result == "error:state option disappeared":
+                                    break  # genuinely absent, don't retry
 
-                            # ── Log outcome ───────────────────────────────────
                             if result == "saved":
                                 log.info(f"{label} ... saved")
                                 total_saved += 1
@@ -565,7 +530,7 @@ def main():
                                 total_errors += 1
 
     except Exception as critical:
-        log.exception(f"[CRITICAL] Unhandled exception: {critical}")
+        log.exception(f"[CRITICAL] {critical}")
 
     finally:
         log.info("\n" + "=" * 60)
