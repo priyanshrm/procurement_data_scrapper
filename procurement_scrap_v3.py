@@ -65,10 +65,10 @@ def wait_for_page_load(driver, timeout=30):
             return False
     WebDriverWait(driver, timeout).until(page_ready)
 
-def check_for_missing_field_warning(driver) -> bool:
+def check_for_missing_state_warning(driver) -> bool:
     """
-    Scans the DOM immediately for UI configuration alerts indicating 
-    that no child elements exist for the current selection.
+    Targeted evaluation to confirm if the state layout is explicitly 
+    blocked for the selected combination.
     """
     try:
         warnings = driver.find_elements(By.CSS_SELECTOR, ".missing_field")
@@ -82,8 +82,6 @@ def check_for_missing_field_warning(driver) -> bool:
 def get_select_options(driver, select_id) -> list[dict]:
     try:
         el = driver.find_element(By.ID, select_id)
-        
-        # Fast exit if Angular explicitly disabled the element
         if el.get_attribute("disabled") is not None:
             return []
             
@@ -100,16 +98,18 @@ def get_select_options(driver, select_id) -> list[dict]:
 
 def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeout=12):
     """
-    Selects a dropdown option, then samples the child element until its structure 
-    completely settles for 400ms. Aborts early if a missing_field error appears.
+    Selects an item and provides structural padding to allow Angular to flush out 
+    stale elements and stabilize the target child element options tree.
     """
     parent_el = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.ID, parent_id))
     )
     Select(parent_el).select_by_value(value)
     
+    # Crucial padding: allows the application DOM tree to register the change events
+    time.sleep(0.5)
+    
     if not child_id:
-        time.sleep(0.2)
         return
 
     end_time = time.time() + timeout
@@ -117,13 +117,8 @@ def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeo
     stable_start = None
     
     while time.time() < end_time:
-        if check_for_missing_field_warning(driver):
-            return  # Angular rendered an explicit empty warning block; exit wait cascade early.
-
         try:
             child_el = driver.find_element(By.ID, child_id)
-            
-            # If the target dropdown was intentionally disabled by the application UI
             if child_el.get_attribute("disabled") is not None:
                 return
                 
@@ -144,9 +139,6 @@ def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeo
         time.sleep(0.1)
 
 def click_submit_and_wait(driver, wait_timeout=45):
-    """
-    Tracks state transitions reliably without modifying DOM nodes directly.
-    """
     old_alert_el = None
     try:
         old_alert_el = driver.find_element(By.CSS_SELECTOR, ".alert-danger-msg")
@@ -233,8 +225,8 @@ MARKETING_SEASONS = [
     {"value": "2", "text": "RMS"},
 ]
 
+# 2026-2027 Excluded as requested
 MARKETING_YEARS = [
-    {"value": "2026-2027", "text": "2026-2027"},  # Updated to reflect new selection options
     {"value": "2025-2026", "text": "2025-2026"},
     {"value": "2024-2025", "text": "2024-2025"},
     {"value": "2023-2024", "text": "2023-2024"},
@@ -250,7 +242,7 @@ already_done = get_existing_downloads()
 total_saved, total_skipped, total_no_data, total_errors = 0, 0, 0, 0
 
 print(f"\n{'='*60}")
-print(f"  Procurement data downloader (Max Integrity Configuration Build)")
+print(f"  Procurement data downloader (Context-Isolated Stability Build)")
 print(f"  Saving to: {DOWNLOAD_DIR}")
 print(f"  Already downloaded: {len(already_done)} file(s)")
 print(f"{'='*60}")
@@ -275,13 +267,11 @@ try:
                 select_dropdown_and_stabilize(driver, "m_s_id", season["value"], child_id="m_year")
                 select_dropdown_and_stabilize(driver, "m_year", year["value"], child_id="comdty_id")
 
-                if check_for_missing_field_warning(driver):
-                    print("  (No commodities available for this configuration)")
-                    continue
-
                 commodities = get_select_options(driver, "comdty_id")
+                if not commodities:
+                    print("  (No commodities found)")
+                    continue
                 print(f"  {len(commodities)} commodities identified")
-                if not commodities: continue
 
                 for commodity in commodities:
                     commodity_text = commodity["text"]
@@ -289,13 +279,10 @@ try:
 
                     try:
                         select_dropdown_and_stabilize(driver, "comdty_id", commodity["value"], child_id="c_type_id")
-                        
-                        if check_for_missing_field_warning(driver):
-                            print("  │  └─ (No crop types available)")
-                            continue
-
                         crop_types = get_select_options(driver, "c_type_id")
-                        if not crop_types: continue
+                        if not crop_types:
+                            print("  │  └─ (No crop types found)")
+                            continue
 
                         for crop in crop_types:
                             crop_text = crop["text"]
@@ -304,15 +291,15 @@ try:
                             try:
                                 select_dropdown_and_stabilize(driver, "c_type_id", crop["value"], child_id="st_id")
                                 
-                                # Safety Intercept: Check if the selection combination has generated an empty state layout
-                                if check_for_missing_field_warning(driver):
+                                # Check for the state warning alert here, after UI elements have settled
+                                if check_for_missing_state_warning(driver):
                                     print("  │  │  └─ (No states available for this combination)")
                                     total_no_data += 1
                                     continue
 
                                 states = get_select_options(driver, "st_id")
                                 if not states:
-                                    print("  │  │  └─ (No states loaded)")
+                                    print("  │  │  └─ (State list empty)")
                                     continue
                                 
                                 for state in states:
@@ -374,7 +361,7 @@ try:
                         continue
 
             except Exception as combo_err:
-                print(f"\n  Loop contextual alignment sync tracking break in {season_text} {year_text}, re-routing session workflow...")
+                print(f"\n  Loop synchronization break in {season_text} {year_text}, refreshing session context...")
                 driver.get(URL)
                 wait_for_page_load(driver)
                 continue
