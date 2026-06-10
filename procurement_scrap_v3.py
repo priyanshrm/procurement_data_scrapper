@@ -128,33 +128,57 @@ def wait_for_dropdown_options(
 ) -> list[dict]:
     """
     Wait until options stabilise across `stable_rounds` consecutive 200ms reads.
+
+    check_no_data_warning: if True, watch for Angular's ".missing_field" warning.
+    IMPORTANT: this warning is always present in the DOM (just hidden via CSS).
+    We only trust it AFTER the dropdown has had time to populate — specifically,
+    only after we've seen at least one non-empty snapshot that then went back to
+    empty, OR after a minimum dwell time. Checking it on the very first iteration
+    produces false-positives during the brief clear-then-repopulate transition.
     """
     end = time.time() + timeout
     last: list[dict] | None = None
     hits = 0
+    # Track how long we've been waiting with an empty dropdown.
+    # Only trust the no-data warning after the dropdown has been empty for
+    # at least this many seconds — long enough for Angular to have repopulated
+    # it if data existed.
+    EMPTY_DWELL_BEFORE_WARNING = 2.0
+    empty_since: float | None = None
 
     while time.time() < end:
-        if check_no_data_warning:
-            try:
-                for w in driver.find_elements(By.CSS_SELECTOR, ".missing_field"):
-                    if w.is_displayed() and "no state list found" in w.text.lower():
-                        return []
-            except Exception:
-                pass
-
         try:
             snap = _read_options(driver, select_id)
         except (StaleElementReferenceException, NoSuchElementException):
             last, hits = None, 0
+            empty_since = None
             time.sleep(0.2)
             continue
 
-        if snap and snap == last:
-            hits += 1
-            if hits >= stable_rounds:
-                return snap
+        if snap:
+            # Dropdown has options — reset empty tracker, run stability check
+            empty_since = None
+            if snap == last:
+                hits += 1
+                if hits >= stable_rounds:
+                    return snap
+            else:
+                last, hits = snap, 0
         else:
-            last, hits = snap, 0
+            # Dropdown is empty right now
+            if empty_since is None:
+                empty_since = time.time()
+            last, hits = [], 0
+
+            # Only check the warning after the dropdown has been continuously
+            # empty for EMPTY_DWELL_BEFORE_WARNING seconds
+            if check_no_data_warning and (time.time() - empty_since) >= EMPTY_DWELL_BEFORE_WARNING:
+                try:
+                    for w in driver.find_elements(By.CSS_SELECTOR, ".missing_field"):
+                        if w.is_displayed() and "no state list found" in w.text.lower():
+                            return []
+                except Exception:
+                    pass
 
         time.sleep(0.2)
 
@@ -192,35 +216,27 @@ def reload_and_wait(driver) -> bool:
                 return False
         WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(season_ready)
 
-        # ── Force-reset the form to a clean blank state ──────────────────────
-        # Angular restores the last-used combo from session state.
-        # We must reset every dynamic dropdown to its placeholder so that our
-        # own selection sequence starts from a known-blank state.
-        #
-        # Strategy: select placeholder on comdty_id, wait for c_type_id and
-        # st_id to clear (proves Angular's cascade fired), then we're clean.
+        # ── Force-reset Angular's persisted form state ───────────────────────
+        # Angular stores the last-used combo in sessionStorage/localStorage,
+        # so a simple driver.get() reloads the same pre-filled form.
+        # Fix: clear browser storage, reload once more, get a blank form.
+        driver.execute_script(
+            "try { window.sessionStorage.clear(); } catch(e) {}"
+            "try { window.localStorage.clear();   } catch(e) {}"
+        )
+        driver.get(URL)
+        WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
+            lambda d: "CFPP" in d.title or "cfpp" in d.title.lower()
+        )
+        WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(season_ready)
 
-        # Try resetting commodity → clears crop + state
-        commodity_reset_ok = False
-        for _ in range(3):
-            try:
-                opts = _read_options(driver, "comdty_id")
-                if not opts:
-                    # Already on placeholder — downstream should also be empty
-                    commodity_reset_ok = True
-                    break
-                # There are live options — select the placeholder to clear them
-                _select_placeholder(driver, "comdty_id")
-                time.sleep(0.3)
-                # Wait for c_type_id to clear
-                if wait_for_dropdown_to_clear(driver, "c_type_id", timeout=6):
-                    commodity_reset_ok = True
-                    break
-            except Exception:
-                time.sleep(0.3)
-
-        if not commodity_reset_ok:
-            log.warning("  reload: could not fully reset commodity dropdown — proceeding anyway")
+        # Wait for comdty_id to be enabled (Angular component initialised)
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.find_element(By.ID, "comdty_id").get_attribute("disabled") is None
+            )
+        except Exception:
+            pass
 
         # Final check: m_s_id still has its 2 options
         return len(_read_options(driver, "m_s_id")) >= 2
