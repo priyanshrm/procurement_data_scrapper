@@ -435,6 +435,9 @@ def process_combination(
 # =========================================
 # PER-CROP STATE LOOP
 # =========================================
+# =========================================
+# PER-CROP STATE LOOP
+# =========================================
 
 def process_states_for_crop(
     driver_ref: list,           
@@ -450,27 +453,24 @@ def process_states_for_crop(
     def driver():
         return driver_ref[0]
 
-    def _reload_or_restart(reason: str = "") -> bool:
-        if reason:
-            log.info(f"  │  │  │  ({reason})")
-        if not is_driver_alive(driver()):
-            log.warning("  │  │  │  Driver process unresponsive — forced cleanup…")
-            driver_ref[0] = restart_driver(driver())
-        return reload_and_wait(driver())
+    def _hard_restart_and_navigate() -> bool:
+        """Forces a complete browser restart and navigates back to the current crop."""
+        driver_ref[0] = restart_driver(driver())
+        if not reload_and_wait(driver()):
+            return False
+        return navigate_to_crop(driver(), season, year, commodity, crop)
 
     def _navigate_to_this_crop() -> bool:
-        if not _reload_or_restart():
+        if not is_driver_alive(driver()):
+            return _hard_restart_and_navigate()
+        if not reload_and_wait(driver()):
             return False
         return navigate_to_crop(driver(), season, year, commodity, crop)
 
     def _proactive_restart_if_due() -> bool:
         if download_counter[0] > 0 and download_counter[0] % DRIVER_RESTART_EVERY == 0:
             log.info(f"  ♻  Proactive restart triggered at threshold ({download_counter[0]} downloads)…")
-            driver_ref[0] = restart_driver(driver())
-            if not reload_and_wait(driver()) or not navigate_to_crop(driver(), season, year, commodity, crop):
-                log.warning("  ♻  Re-navigation routing sequence failed post-restart.")
-                return False
-            log.info("  ♻  Proactive restart baseline stabilized.")
+            return _hard_restart_and_navigate()
         return True
 
     states = wait_for_dropdown_options(
@@ -490,13 +490,17 @@ def process_states_for_crop(
 
         for attempt in range(1, MAX_COMBO_RETRIES + 1):
             if attempt > 1:
-                log.info(f"  │  │  │  (System retry tier {attempt}/{MAX_COMBO_RETRIES})")
-                if not _navigate_to_this_crop():
-                    result = "error:navigation structural reset failed"
+                log.warning(f"  │  │  │  (Failure detected. Hard restarting Chrome and retrying {attempt}/{MAX_COMBO_RETRIES})")
+                
+                # Nuke Chrome, restart, and walk back down the exact menu path
+                if not _hard_restart_and_navigate():
+                    result = "error:navigation_failed_after_hard_restart"
                     break
+                
+                # Verify the state dropdown is still valid after restart
                 retry_states = wait_for_dropdown_options(driver(), "st_id", timeout=15, stable_rounds=3)
                 if not any(s["value"] == state["value"] for s in retry_states):
-                    result = "error:state structural frame missing on cycle"
+                    result = "error:state_missing_after_restart"
                     break
 
             try:
@@ -504,8 +508,8 @@ def process_states_for_crop(
             except WebDriverException as wde:
                 log.warning(f"  │  │  WebDriver connection broken contextually: {wde}")
                 result = "error:driver_crash_event"
-                driver_ref[0] = restart_driver(driver())
 
+            # If it succeeded, or there was legitimately no data/it was skipped, break out of the retry loop
             if result in ("saved", "skipped", "no_data", "error:state option disappeared"):
                 break
 
@@ -533,13 +537,13 @@ def process_states_for_crop(
                 errors += 1
                 break
         else:
-            log.warning(f"{label} ... {result}")
+            log.warning(f"{label} ... {result} (Max retries reached)")
             errors += 1
-            if not _navigate_to_this_crop():
+            # If a state completely failed after all max retries, do a hard reset before trying the next state in the loop
+            if not _hard_restart_and_navigate():
                 break
 
     return saved, skipped, no_data, errors
-
 
 # =========================================
 # MAIN CONTROL ENGINE
