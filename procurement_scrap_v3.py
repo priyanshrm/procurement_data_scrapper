@@ -139,10 +139,6 @@ def wait_for_dropdown_options(
     end = time.time() + timeout
     last: list[dict] | None = None
     hits = 0
-    # Track how long we've been waiting with an empty dropdown.
-    # Only trust the no-data warning after the dropdown has been empty for
-    # at least this many seconds — long enough for Angular to have repopulated
-    # it if data existed.
     EMPTY_DWELL_BEFORE_WARNING = 2.0
     empty_since: float | None = None
 
@@ -156,7 +152,6 @@ def wait_for_dropdown_options(
             continue
 
         if snap:
-            # Dropdown has options — reset empty tracker, run stability check
             empty_since = None
             if snap == last:
                 hits += 1
@@ -165,13 +160,10 @@ def wait_for_dropdown_options(
             else:
                 last, hits = snap, 0
         else:
-            # Dropdown is empty right now
             if empty_since is None:
                 empty_since = time.time()
             last, hits = [], 0
 
-            # Only check the warning after the dropdown has been continuously
-            # empty for EMPTY_DWELL_BEFORE_WARNING seconds
             if check_no_data_warning and (time.time() - empty_since) >= EMPTY_DWELL_BEFORE_WARNING:
                 try:
                     for w in driver.find_elements(By.CSS_SELECTOR, ".missing_field"):
@@ -193,22 +185,15 @@ def reload_and_wait(driver) -> bool:
     Load the page and wait until:
     1. The page title is correct (Angular app loaded).
     2. m_s_id has its 2 static options (KMS/RMS).
-    3. The form is in a CLEAN state — all dynamic dropdowns (comdty, crop, state)
-       show only their placeholder option.
-
-    The page persists Angular form state across reloads (session restoration).
-    If we land on a pre-filled state, we force-reset by selecting placeholders
-    and waiting for downstream cascades to clear.
+    3. Browser storage cleared to avoid Angular form state restoration.
     """
     try:
         driver.get(URL)
 
-        # Wait for title / Angular bundle
         WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
             lambda d: "CFPP" in d.title or "cfpp" in d.title.lower()
         )
 
-        # Wait for m_s_id to have KMS + RMS
         def season_ready(d):
             try:
                 return len(_read_options(d, "m_s_id")) >= 2
@@ -216,10 +201,7 @@ def reload_and_wait(driver) -> bool:
                 return False
         WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(season_ready)
 
-        # ── Force-reset Angular's persisted form state ───────────────────────
-        # Angular stores the last-used combo in sessionStorage/localStorage,
-        # so a simple driver.get() reloads the same pre-filled form.
-        # Fix: clear browser storage, reload once more, get a blank form.
+        # Clear Angular's persisted form state, then reload once more
         driver.execute_script(
             "try { window.sessionStorage.clear(); } catch(e) {}"
             "try { window.localStorage.clear();   } catch(e) {}"
@@ -230,7 +212,6 @@ def reload_and_wait(driver) -> bool:
         )
         WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(season_ready)
 
-        # Wait for comdty_id to be enabled (Angular component initialised)
         try:
             WebDriverWait(driver, 10).until(
                 lambda d: d.find_element(By.ID, "comdty_id").get_attribute("disabled") is None
@@ -238,7 +219,6 @@ def reload_and_wait(driver) -> bool:
         except Exception:
             pass
 
-        # Final check: m_s_id still has its 2 options
         return len(_read_options(driver, "m_s_id")) >= 2
 
     except TimeoutException:
@@ -288,7 +268,6 @@ def navigate_to_crop(driver, season, year, commodity, crop) -> bool:
     """Navigate all four dropdowns to a specific crop, with downstream-clear gates."""
     return (
         robust_select(driver, "m_s_id",    season["value"],    downstream_id=None)
-        # m_year is static (not cleared by season change), so no downstream gate
         and robust_select(driver, "m_year",    year["value"],      downstream_id="comdty_id")
         and robust_select(driver, "comdty_id", commodity["value"], downstream_id="c_type_id")
         and robust_select(driver, "c_type_id", crop["value"],      downstream_id="st_id")
@@ -299,10 +278,6 @@ def navigate_to_crop(driver, season, year, commodity, crop) -> bool:
 # =========================================
 
 def _get_result_signature(driver) -> str:
-    """
-    Reads the metadata band Angular renders above the results table.
-    e.g. 'KMS | 2025-2026 | Paddy | Kharif || ANDHRA PRADESH'
-    """
     try:
         meta_els = driver.find_elements(By.CSS_SELECTOR, ".table-warp .to-bg .col-md-3")
         meta = " | ".join(e.text.strip() for e in meta_els if e.text.strip())
@@ -316,7 +291,6 @@ def _get_result_signature(driver) -> str:
 
 
 def _table_has_data_rows(driver) -> bool:
-    """True if tbody has ≥1 row with a non-empty cell in position 2 (District Name)."""
     try:
         rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
         for row in rows:
@@ -331,17 +305,7 @@ def _table_has_data_rows(driver) -> bool:
 def click_submit_get_result(driver, expected_state_name: str) -> str:
     """
     Click Submit and wait for a fresh, confirmed result for `expected_state_name`.
-
     Returns: "ok" | "no_data" | "timeout" | "sig_mismatch"
-
-    CRITICAL: The no-data alert (.alert-danger-msg) persists in the DOM from
-    the previous combination. We must NEVER check it before the result signature
-    has changed — otherwise we get an instant false "no_data" from stale DOM.
-    Order of operations:
-      1. Record pre-submit signature.
-      2. Click submit.
-      3. Wait for signature to CHANGE  ← proves Angular processed this submit.
-      4. Only THEN check alert OR table rows.
     """
     pre_sig = _get_result_signature(driver)
 
@@ -357,15 +321,12 @@ def click_submit_get_result(driver, expected_state_name: str) -> str:
     sig_changed = False
 
     while time.time() < end:
-        # ── Phase 1: wait for signature to change ───────────────────────────
-        # Do NOT check alert here — it may be stale from previous combo.
         if not sig_changed:
             try:
                 sig = _get_result_signature(driver)
                 if sig and sig != pre_sig:
                     sig_changed = True
                     log.debug(f"    sig changed → {sig!r}")
-                    # Validate this result is for the right state
                     if expected_state_name.lower() not in sig.lower():
                         log.warning(f"    sig_mismatch: expected {expected_state_name!r} not in {sig!r}")
                         return "sig_mismatch"
@@ -374,8 +335,6 @@ def click_submit_get_result(driver, expected_state_name: str) -> str:
             time.sleep(0.25)
             continue
 
-        # ── Phase 2: sig changed and name matched — now check outcome ────────
-        # Check no-data alert (safe now — Angular has rendered this combo's result)
         try:
             for alert in driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg"):
                 if alert.is_displayed() and "no records found" in alert.text.lower():
@@ -383,11 +342,9 @@ def click_submit_get_result(driver, expected_state_name: str) -> str:
         except Exception:
             pass
 
-        # Check for table data rows
         if _table_has_data_rows(driver):
             return "ok"
 
-        # sig changed and name matched, but neither alert nor rows yet — keep polling
         time.sleep(0.25)
 
     return "timeout"
@@ -423,13 +380,21 @@ def process_combination(
     state: dict,
     already_done: set,
 ) -> str:
+    """
+    Select the state, submit, download the Excel file.
+
+    KEY CHANGE: After a successful download we reload the page immediately
+    and re-navigate back to the current crop level. This prevents Angular
+    state drift from causing the next state selection to silently fail.
+    The caller passes `needs_reload=True` on first use after a prior download.
+    """
     fname = sanitize(
         f"{season['text']}_{year['text']}_{commodity['text']}_{crop['text']}_{state['text']}"
     )
     if fname in already_done:
         return "skipped"
 
-    # Confirm state option still present (Angular may have re-rendered)
+    # Confirm state option is still present (Angular may have re-rendered)
     states_now = wait_for_dropdown_options(driver, "st_id", timeout=12, stable_rounds=3)
     if not any(s["value"] == state["value"] for s in states_now):
         return "error:state option disappeared"
@@ -444,8 +409,6 @@ def process_combination(
         return f"timeout_or_error:{status}"
 
     # Wait for the table to fully render before triggering the download.
-    # The Excel export reads from the Angular component's in-memory data —
-    # if clicked too early, it exports a partial or empty dataset.
     time.sleep(5)
 
     before = set(os.listdir(DOWNLOAD_DIR))
@@ -470,6 +433,120 @@ def process_combination(
     os.rename(downloaded, target)
     already_done.add(fname)
     return "saved"
+
+
+# =========================================
+# PER-CROP STATE LOOP  ← NEW helper
+# =========================================
+
+def process_states_for_crop(
+    driver,
+    season: dict,
+    year: dict,
+    commodity: dict,
+    crop: dict,
+    already_done: set,
+) -> tuple[int, int, int, int]:
+    """
+    Iterate all states for a given (season, year, commodity, crop).
+
+    After every successful download → reload + re-navigate to this crop
+    so the next state selection starts from a clean Angular form.
+
+    Returns (saved, skipped, no_data, errors).
+    """
+    saved = skipped = no_data = errors = 0
+
+    def _navigate_to_this_crop() -> bool:
+        """Reload page and drive dropdowns back to the current crop level."""
+        if not reload_and_wait(driver):
+            return False
+        return navigate_to_crop(driver, season, year, commodity, crop)
+
+    # ── Read initial state list ──────────────────────────────────────────────
+    states = wait_for_dropdown_options(
+        driver, "st_id",
+        timeout=15, stable_rounds=3,
+        check_no_data_warning=True,
+    )
+    if not states:
+        log.info("  │  │  └─ (No states)")
+        return 0, 0, 1, 0   # count as no_data
+
+    log.info(f"  │  │   {len(states)} states")
+
+    for state in states:
+        label = f"  │  │  ├─ {state['text']}"
+        result = "error:not_attempted"
+
+        for attempt in range(1, MAX_COMBO_RETRIES + 1):
+            if attempt > 1:
+                log.info(f"  │  │  │  (retry {attempt}/{MAX_COMBO_RETRIES})")
+                # Full reload + re-navigation on retry
+                if not _navigate_to_this_crop():
+                    result = "error:navigation failed on retry"
+                    break
+                retry_states = wait_for_dropdown_options(
+                    driver, "st_id", timeout=15, stable_rounds=3
+                )
+                if not any(s["value"] == state["value"] for s in retry_states):
+                    result = "error:state gone after retry"
+                    break
+
+            result = process_combination(
+                driver, season, year, commodity, crop, state, already_done
+            )
+
+            if result in ("saved", "skipped", "no_data"):
+                break
+            if result == "error:state option disappeared":
+                break  # genuinely absent
+
+        # ── After a successful download: reload + re-navigate ────────────────
+        # This is the core fix: Angular's in-memory state becomes unreliable
+        # once a download has been triggered. A fresh page load + full
+        # dropdown re-navigation guarantees the next state selection works.
+        if result == "saved":
+            log.info(f"{label} ... saved")
+            saved += 1
+            log.info("  │  │  │  (reloading after download…)")
+            if not _navigate_to_this_crop():
+                log.warning("  │  │  │  Re-navigation after download failed; remaining states may be skipped.")
+                errors += 1
+                break  # can't continue this crop safely
+
+        elif result == "skipped":
+            log.info(f"{label} ... skipped")
+            skipped += 1
+            # Also reload after a skip — the file already exists, but Angular
+            # state may still have drifted from the earlier attempted submit.
+            log.info("  │  │  │  (reloading after skip…)")
+            if not _navigate_to_this_crop():
+                log.warning("  │  │  │  Re-navigation after skip failed.")
+                errors += 1
+                break
+
+        elif result == "no_data":
+            log.info(f"{label} ... no data")
+            no_data += 1
+            # No file downloaded, but still reload to keep Angular state clean.
+            log.info("  │  │  │  (reloading after no_data…)")
+            if not _navigate_to_this_crop():
+                log.warning("  │  │  │  Re-navigation after no_data failed.")
+                errors += 1
+                break
+
+        else:
+            log.warning(f"{label} ... {result}")
+            errors += 1
+            # On error also reload so we don't carry forward a broken state.
+            log.info("  │  │  │  (reloading after error…)")
+            if not _navigate_to_this_crop():
+                log.warning("  │  │  │  Re-navigation after error failed.")
+                break
+
+    return saved, skipped, no_data, errors
+
 
 # =========================================
 # MAIN ENGINE
@@ -500,7 +577,7 @@ def main():
     total_saved = total_skipped = total_no_data = total_errors = 0
 
     log.info("=" * 60)
-    log.info("  Procurement Scraper — v6.1")
+    log.info("  Procurement Scraper — v7.0")
     log.info(f"  Destination : {DOWNLOAD_DIR}")
     log.info(f"  Already done: {len(already_done)} files")
     log.info("=" * 60)
@@ -523,13 +600,11 @@ def main():
                     total_errors += 1
                     continue
 
-                # Select season (m_year is static — no downstream clear needed)
                 if not robust_select(driver, "m_s_id", season["value"]):
                     log.warning("  Season select failed; skipping.")
                     total_errors += 1
                     continue
 
-                # Select year → clears commodity
                 if not robust_select(driver, "m_year", year["value"], downstream_id="comdty_id"):
                     log.warning("  Year select failed; skipping.")
                     total_errors += 1
@@ -544,13 +619,12 @@ def main():
                 for commodity in commodities:
                     log.info(f"  ┌─ {commodity['text']}")
 
-                    # Fresh page per commodity to avoid accumulated Angular drift
+                    # Fresh page per commodity
                     if not reload_and_wait(driver):
                         log.warning("  │  Reload failed; skipping commodity.")
                         total_errors += 1
                         continue
 
-                    # Re-navigate to this commodity
                     if not robust_select(driver, "m_s_id", season["value"]):
                         log.warning("  │  Season re-select failed.")
                         total_errors += 1
@@ -572,66 +646,46 @@ def main():
                     for crop in crop_types:
                         log.info(f"  │  ├─ {crop['text']}")
 
-                        # Select crop type; wait for state dropdown to clear
+                        # Select crop type and wait for state dropdown to clear,
+                        # then hand off to the dedicated per-crop state loop.
                         if not robust_select(driver, "c_type_id", crop["value"], downstream_id="st_id"):
                             log.warning("  │  │  Crop select failed.")
                             total_errors += 1
+                            # Reload and re-navigate back to commodity level
+                            if reload_and_wait(driver):
+                                robust_select(driver, "m_s_id", season["value"])
+                                robust_select(driver, "m_year", year["value"], downstream_id="comdty_id")
+                                robust_select(driver, "comdty_id", commodity["value"], downstream_id="c_type_id")
                             continue
 
-                        # Read state list after it has stabilised
-                        states = wait_for_dropdown_options(
-                            driver, "st_id",
-                            timeout=15, stable_rounds=3,
-                            check_no_data_warning=True,
+                        s, sk, nd, er = process_states_for_crop(
+                            driver, season, year, commodity, crop, already_done
                         )
-                        if not states:
-                            log.info("  │  │  └─ (No states)")
-                            total_no_data += 1
-                            continue
-                        log.info(f"  │  │   {len(states)} states")
+                        total_saved    += s
+                        total_skipped  += sk
+                        total_no_data  += nd
+                        total_errors   += er
 
-                        for state in states:
-                            label = f"  │  │  ├─ {state['text']}"
-                            result = "error:not_attempted"
-
-                            for attempt in range(1, MAX_COMBO_RETRIES + 1):
-                                if attempt > 1:
-                                    log.info(f"  │  │  │  (retry {attempt}/{MAX_COMBO_RETRIES})")
-                                    # Full reload + re-navigation on retry
-                                    if not reload_and_wait(driver):
-                                        result = "error:reload failed"
-                                        break
-                                    if not navigate_to_crop(driver, season, year, commodity, crop):
-                                        result = "error:navigation failed on retry"
-                                        break
-                                    retry_states = wait_for_dropdown_options(
-                                        driver, "st_id", timeout=15, stable_rounds=3
-                                    )
-                                    if not any(s["value"] == state["value"] for s in retry_states):
-                                        result = "error:state gone after retry"
-                                        break
-
-                                result = process_combination(
-                                    driver, season, year, commodity, crop, state, already_done
-                                )
-
-                                if result in ("saved", "skipped", "no_data"):
-                                    break
-                                if result == "error:state option disappeared":
-                                    break  # genuinely absent
-
-                            if result == "saved":
-                                log.info(f"{label} ... saved")
-                                total_saved += 1
-                            elif result == "skipped":
-                                log.info(f"{label} ... skipped")
-                                total_skipped += 1
-                            elif result == "no_data":
-                                log.info(f"{label} ... no data")
-                                total_no_data += 1
-                            else:
-                                log.warning(f"{label} ... {result}")
-                                total_errors += 1
+                        # After process_states_for_crop the page has been reloaded
+                        # and re-navigated to the crop level. To advance to the NEXT
+                        # crop we only need to re-select commodity so c_type_id repopulates.
+                        # A full reload + season/year/commodity re-nav is safest here.
+                        if not reload_and_wait(driver):
+                            log.warning("  │  Reload between crops failed.")
+                            total_errors += 1
+                            break
+                        if not robust_select(driver, "m_s_id", season["value"]):
+                            log.warning("  │  Season re-select (between crops) failed.")
+                            total_errors += 1
+                            break
+                        if not robust_select(driver, "m_year", year["value"], downstream_id="comdty_id"):
+                            log.warning("  │  Year re-select (between crops) failed.")
+                            total_errors += 1
+                            break
+                        if not robust_select(driver, "comdty_id", commodity["value"], downstream_id="c_type_id"):
+                            log.warning("  │  Commodity re-select (between crops) failed.")
+                            total_errors += 1
+                            break
 
     except Exception as critical:
         log.exception(f"[CRITICAL] {critical}")
