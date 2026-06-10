@@ -91,53 +91,60 @@ def get_select_options(driver, select_id) -> list[dict]:
 def select_dropdown_dynamic(driver, parent_id, value, child_id=None):
     """
     Dynamically select an option and wait EXACTLY until the target child dropdown
-    has its DOM rebuilt by Angular, eliminating the need for manual sleeps.
+    has its DOM rebuilt by Angular AND contains valid new data.
     """
     parent_el = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.ID, parent_id))
     )
     
-    old_child_id = None
     old_options = []
-    
     if child_id:
         try:
             child_el = driver.find_element(By.ID, child_id)
-            old_child_id = child_el.id
-            old_options = [opt.text for opt in Select(child_el).options]
+            # Filter out the "Select" placeholder (usually value "0" or empty)
+            old_options = [
+                opt.text for opt in Select(child_el).options 
+                if opt.get_attribute("value") and opt.get_attribute("value") != "0"
+            ]
         except BaseException:
             pass
 
     Select(parent_el).select_by_value(value)
 
     if not child_id:
-        return # No child dependency to wait for
+        return  # No child dependency to wait for
 
     def child_updated(d):
         try:
             body = d.find_element(By.TAG_NAME, "body").text.lower()
             if any(phrase in body for phrase in NO_DATA_PHRASES):
-                return True # Triggered a no-data state
+                return True  # Triggered a no-data state
             
             new_child = d.find_element(By.ID, child_id)
-            if new_child.id != old_child_id:
-                return True # DOM Element was rebuilt
+            new_options = [
+                opt.text for opt in Select(new_child).options 
+                if opt.get_attribute("value") and opt.get_attribute("value") != "0"
+            ]
             
-            new_options = [opt.text for opt in Select(new_child).options]
+            # CRITICAL FIX: Don't return True if Angular just cleared the list mid-load
+            if len(new_options) == 0:
+                return False
+                
+            # If the options have successfully changed and populated
             if new_options != old_options:
-                return True # Data changed
+                return True 
                 
             return False
-        except StaleElementReferenceException:
-            return True # Currently rebuilding
+        except (StaleElementReferenceException, NoSuchElementException):
+            return False  # Currently rebuilding, keep waiting
         except BaseException:
             return False
 
     try:
-        # A short timeout because occasionally the site returns identical unchanged data
-        WebDriverWait(driver, 5).until(child_updated)
+        # Increased timeout from 5 to 15 seconds to handle slow NIC portal responses
+        WebDriverWait(driver, 15).until(child_updated)
     except TimeoutException:
-        pass
+        print(f" [Warning: Timed out waiting for {child_id} to populate]")
 
 def click_submit_and_wait(driver, wait_timeout=60):
     """
@@ -163,7 +170,7 @@ def click_submit_and_wait(driver, wait_timeout=60):
             
             current_rows = d.find_elements(By.CSS_SELECTOR, "table tbody tr")
             if not current_rows:
-                return False # Still loading rows
+                return False  # Still loading rows
                 
             # Guarantee these are new rows, not ghost rows from the previous run
             if old_row_ids and current_rows[0].id in old_row_ids:
@@ -201,9 +208,8 @@ def wait_for_download(directory: str, before: set, timeout: int = 60) -> str | N
         crdownloads = [f for f in current if f.endswith(".crdownload")]
         if new_files and not crdownloads:
             return os.path.join(directory, new_files[0])
-        time.sleep(0.5) # OS File watcher polling (not a UI wait)
+        time.sleep(0.5)  # OS File watcher polling (not a UI wait)
     return None
-
 
 # =========================================
 # FIXED DROPDOWN VALUES
@@ -230,7 +236,7 @@ already_done = get_existing_downloads()
 total_saved, total_skipped, total_no_data, total_errors = 0, 0, 0, 0
 
 print(f"\n{'='*60}")
-print(f"  Procurement data downloader (Dynamic Waits)")
+print(f"  Procurement data downloader (Dynamic Waits Fixed)")
 print(f"  Saving to: {DOWNLOAD_DIR}")
 print(f"  Already downloaded: {len(already_done)} file(s) — will skip these")
 print(f"{'='*60}")
@@ -244,7 +250,7 @@ try:
         except Exception as load_err:
             print(f"  Page load attempt {attempt+1} failed: {load_err}")
             if attempt == 2: raise
-            time.sleep(5) # Network error backoff
+            time.sleep(5)  # Network error backoff
 
     for season in MARKETING_SEASONS:
         for year in MARKETING_YEARS:
@@ -252,8 +258,8 @@ try:
             print(f"\n► {season_text}  {year_text}")
 
             try:
-                # Select Parent Dropdowns dynamically
-                select_dropdown_dynamic(driver, "m_s_id", season["value"], child_id="comdty_id")
+                # FIX: Season updates Year, Year updates Commodity
+                select_dropdown_dynamic(driver, "m_s_id", season["value"], child_id="m_year")
                 select_dropdown_dynamic(driver, "m_year", year["value"], child_id="comdty_id")
 
                 commodities = get_select_options(driver, "comdty_id")
