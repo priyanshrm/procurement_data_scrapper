@@ -24,7 +24,7 @@ jobs:
       # Selenium 4.10+ automatically handles downloading the correct ChromeDriver, 
       # and ubuntu-latest already has Chrome installed.
       - name: Run Scraper
-        run: python scraper.py
+        run: python procurement_scrap_v3.py
 
       - name: Upload Downloaded Data
         uses: actions/upload-artifact@v4
