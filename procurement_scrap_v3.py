@@ -43,7 +43,7 @@ driver.set_page_load_timeout(60)
 driver.set_script_timeout(30)
 
 # =========================================
-# NON-DESTRUCTIVE DYNAMIC WAITS & HELPERS
+# HIGH-INTEGRITY DYNAMIC WAITS & HELPERS
 # =========================================
 
 def sanitize(text: str) -> str:
@@ -65,9 +65,28 @@ def wait_for_page_load(driver, timeout=30):
             return False
     WebDriverWait(driver, timeout).until(page_ready)
 
+def check_for_missing_field_warning(driver) -> bool:
+    """
+    Scans the DOM immediately for UI configuration alerts indicating 
+    that no child elements exist for the current selection.
+    """
+    try:
+        warnings = driver.find_elements(By.CSS_SELECTOR, ".missing_field")
+        for w in warnings:
+            if w.is_displayed() and "no state list found" in w.text.lower():
+                return True
+    except BaseException:
+        pass
+    return False
+
 def get_select_options(driver, select_id) -> list[dict]:
     try:
         el = driver.find_element(By.ID, select_id)
+        
+        # Fast exit if Angular explicitly disabled the element
+        if el.get_attribute("disabled") is not None:
+            return []
+            
         sel = Select(el)
         options = []
         for opt in sel.options:
@@ -82,7 +101,7 @@ def get_select_options(driver, select_id) -> list[dict]:
 def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeout=12):
     """
     Selects a dropdown option, then samples the child element until its structure 
-    completely settles (stops rendering modifications) for 400ms.
+    completely settles for 400ms. Aborts early if a missing_field error appears.
     """
     parent_el = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.ID, parent_id))
@@ -98,8 +117,16 @@ def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeo
     stable_start = None
     
     while time.time() < end_time:
+        if check_for_missing_field_warning(driver):
+            return  # Angular rendered an explicit empty warning block; exit wait cascade early.
+
         try:
             child_el = driver.find_element(By.ID, child_id)
+            
+            # If the target dropdown was intentionally disabled by the application UI
+            if child_el.get_attribute("disabled") is not None:
+                return
+                
             options = [opt.get_attribute("value") for opt in Select(child_el).options]
             current_state = (child_el.id, tuple(options))
             
@@ -118,10 +145,8 @@ def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeo
 
 def click_submit_and_wait(driver, wait_timeout=45):
     """
-    Monitors UI state transitions safely by tracking active element 
-    instances instead of mutating the underlying Angular framework DOM tree.
+    Tracks state transitions reliably without modifying DOM nodes directly.
     """
-    # 1. Grab references to whatever elements are currently on the screen
     old_alert_el = None
     try:
         old_alert_el = driver.find_element(By.CSS_SELECTOR, ".alert-danger-msg")
@@ -136,46 +161,35 @@ def click_submit_and_wait(driver, wait_timeout=45):
     except BaseException:
         pass
 
-    # 2. Click the query submission button
     submit_btn = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
     )
     driver.execute_script("arguments[0].click();", submit_btn)
 
-    # 3. Allow Angular a brief operational padding window to execute the request lifecycle
     time.sleep(1.0)
 
-    # 4. Monitor state changes safely
     end_time = time.time() + wait_timeout
     while time.time() < end_time:
-        # Check if an alert message layout is actively displayed
         try:
             alerts = driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg")
             if alerts:
                 current_alert = alerts[0]
                 if "no records found" in current_alert.text.lower():
-                    if old_alert_el is None:
-                        return "no_data"
-                    elif current_alert != old_alert_el:
+                    if old_alert_el is None or current_alert != old_alert_el:
                         return "no_data"
                     elif old_first_row_el:
                         try:
-                            # If old table data elements throw stale, the container refreshed
                             _ = old_first_row_el.text
                         except StaleElementReferenceException:
                             return "no_data"
         except BaseException:
             pass
 
-        # Check if valid grid rows are loaded in the view
         try:
             rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
             if rows:
                 current_first_row = rows[0]
-                if old_first_row_el is None:
-                    if len(current_first_row.text.strip()) > 2:
-                        return "ok"
-                elif current_first_row != old_first_row_el:
+                if old_first_row_el is None or current_first_row != old_first_row_el:
                     if len(current_first_row.text.strip()) > 2:
                         return "ok"
                 else:
@@ -220,6 +234,7 @@ MARKETING_SEASONS = [
 ]
 
 MARKETING_YEARS = [
+    {"value": "2026-2027", "text": "2026-2027"},  # Updated to reflect new selection options
     {"value": "2025-2026", "text": "2025-2026"},
     {"value": "2024-2025", "text": "2024-2025"},
     {"value": "2023-2024", "text": "2023-2024"},
@@ -235,7 +250,7 @@ already_done = get_existing_downloads()
 total_saved, total_skipped, total_no_data, total_errors = 0, 0, 0, 0
 
 print(f"\n{'='*60}")
-print(f"  Procurement data downloader (High Integrity Lifecycle Build)")
+print(f"  Procurement data downloader (Max Integrity Configuration Build)")
 print(f"  Saving to: {DOWNLOAD_DIR}")
 print(f"  Already downloaded: {len(already_done)} file(s)")
 print(f"{'='*60}")
@@ -260,6 +275,10 @@ try:
                 select_dropdown_and_stabilize(driver, "m_s_id", season["value"], child_id="m_year")
                 select_dropdown_and_stabilize(driver, "m_year", year["value"], child_id="comdty_id")
 
+                if check_for_missing_field_warning(driver):
+                    print("  (No commodities available for this configuration)")
+                    continue
+
                 commodities = get_select_options(driver, "comdty_id")
                 print(f"  {len(commodities)} commodities identified")
                 if not commodities: continue
@@ -270,6 +289,11 @@ try:
 
                     try:
                         select_dropdown_and_stabilize(driver, "comdty_id", commodity["value"], child_id="c_type_id")
+                        
+                        if check_for_missing_field_warning(driver):
+                            print("  │  └─ (No crop types available)")
+                            continue
+
                         crop_types = get_select_options(driver, "c_type_id")
                         if not crop_types: continue
 
@@ -279,8 +303,17 @@ try:
 
                             try:
                                 select_dropdown_and_stabilize(driver, "c_type_id", crop["value"], child_id="st_id")
+                                
+                                # Safety Intercept: Check if the selection combination has generated an empty state layout
+                                if check_for_missing_field_warning(driver):
+                                    print("  │  │  └─ (No states available for this combination)")
+                                    total_no_data += 1
+                                    continue
+
                                 states = get_select_options(driver, "st_id")
-                                if not states: continue
+                                if not states:
+                                    print("  │  │  └─ (No states loaded)")
+                                    continue
                                 
                                 for state in states:
                                     state_text = state["text"]
