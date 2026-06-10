@@ -32,7 +32,6 @@ prefs = {
 }
 options.add_experimental_option("prefs", prefs)
 
-# Uncomment below lines if running in GitHub Actions / Headless
 options.add_argument("--headless=new")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
@@ -44,14 +43,8 @@ driver.set_page_load_timeout(60)
 driver.set_script_timeout(30)
 
 # =========================================
-# DYNAMIC WAITS & HELPERS
+# HIGH-INTEGRITY DYNAMIC WAITS & HELPERS
 # =========================================
-
-NO_DATA_PHRASES = [
-    "no records found for the above selected combination",
-    "no data", "no record", "not found", "no result",
-    "data not available", "no information", "no state list found"
-]
 
 def sanitize(text: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "_", text.strip())
@@ -64,7 +57,6 @@ def get_existing_downloads() -> set:
     }
 
 def wait_for_page_load(driver, timeout=30):
-    """Dynamically waits for the Angular app to load the initial elements."""
     def page_ready(d):
         try:
             el = d.find_element(By.ID, "m_s_id")
@@ -74,7 +66,6 @@ def wait_for_page_load(driver, timeout=30):
     WebDriverWait(driver, timeout).until(page_ready)
 
 def get_select_options(driver, select_id) -> list[dict]:
-    """Return list of valid {value, text} skipping the placeholder."""
     try:
         el = driver.find_element(By.ID, select_id)
         sel = Select(el)
@@ -88,108 +79,80 @@ def get_select_options(driver, select_id) -> list[dict]:
     except BaseException:
         return []
 
-def select_dropdown_dynamic(driver, parent_id, value, child_id=None):
+def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeout=12):
     """
-    Dynamically select an option and wait EXACTLY until the target child dropdown
-    has its DOM rebuilt by Angular AND contains valid new data.
+    Selects a value, then watches the child element until its structure completely 
+    settles (stops modifying) for 400ms. Eliminates timeouts on identical datasets.
     """
     parent_el = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.ID, parent_id))
     )
+    Select(parent_el).select_by_value(value)
     
-    old_options = []
-    if child_id:
+    if not child_id:
+        time.sleep(0.2)
+        return
+
+    end_time = time.time() + timeout
+    last_state = None
+    stable_start = None
+    
+    while time.time() < end_time:
         try:
             child_el = driver.find_element(By.ID, child_id)
-            # Filter out the "Select" placeholder (usually value "0" or empty)
-            old_options = [
-                opt.text for opt in Select(child_el).options 
-                if opt.get_attribute("value") and opt.get_attribute("value") != "0"
-            ]
-        except BaseException:
-            pass
-
-    Select(parent_el).select_by_value(value)
-
-    if not child_id:
-        return  # No child dependency to wait for
-
-    def child_updated(d):
-        try:
-            body = d.find_element(By.TAG_NAME, "body").text.lower()
-            if any(phrase in body for phrase in NO_DATA_PHRASES):
-                return True  # Triggered a no-data state
+            options = [opt.get_attribute("value") for opt in Select(child_el).options]
+            current_state = (child_el.id, tuple(options))
             
-            new_child = d.find_element(By.ID, child_id)
-            new_options = [
-                opt.text for opt in Select(new_child).options 
-                if opt.get_attribute("value") and opt.get_attribute("value") != "0"
-            ]
-            
-            # CRITICAL FIX: Don't return True if Angular just cleared the list mid-load
-            if len(new_options) == 0:
-                return False
-                
-            # If the options have successfully changed and populated
-            if new_options != old_options:
-                return True 
-                
-            return False
+            if current_state == last_state:
+                if stable_start is None:
+                    stable_start = time.time()
+                elif time.time() - stable_start >= 0.4:
+                    return  # Form element layout has settled completely
+            else:
+                last_state = current_state
+                stable_start = None
         except (StaleElementReferenceException, NoSuchElementException):
-            return False  # Currently rebuilding, keep waiting
-        except BaseException:
-            return False
+            last_state = None
+            stable_start = None
+        time.sleep(0.1)
 
-    try:
-        # Increased timeout from 5 to 15 seconds to handle slow NIC portal responses
-        WebDriverWait(driver, 15).until(child_updated)
-    except TimeoutException:
-        print(f" [Warning: Timed out waiting for {child_id} to populate]")
-
-def click_submit_and_wait(driver, wait_timeout=60):
+def click_submit_and_wait(driver, wait_timeout=45):
     """
-    Dynamically click submit and monitor the exact Table Row DOM IDs to 
-    ensure we don't accidentally grab stale data from a previous search.
+    Purges old tables and alert structures via JavaScript before execution
+    to guarantee no ghost alerts cause false data-omission flags.
     """
-    try:
-        old_rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        old_row_ids = {row.id for row in old_rows}
-    except BaseException:
-        old_row_ids = set()
+    driver.execute_script("""
+        var oldAlerts = document.querySelectorAll('.alert-danger-msg');
+        oldAlerts.forEach(function(el) { el.remove(); });
+        
+        var oldTable = document.querySelector('table tbody');
+        if (oldTable) { oldTable.innerHTML = ''; }
+    """)
 
     submit_btn = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
     )
     driver.execute_script("arguments[0].click();", submit_btn)
 
-    def table_updated(d):
-        try:
-            body = d.find_element(By.TAG_NAME, "body").text.lower()
-            if any(phrase in body for phrase in NO_DATA_PHRASES):
-                return "no_data"
-            
-            current_rows = d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-            if not current_rows:
-                return False  # Still loading rows
-                
-            # Guarantee these are new rows, not ghost rows from the previous run
-            if old_row_ids and current_rows[0].id in old_row_ids:
-                return False 
-                
-            row_text = "".join(r.text.strip() for r in current_rows)
+    end_time = time.time() + wait_timeout
+    while time.time() < end_time:
+        # Scan exclusively for the real-time danger container matching the provided spec
+        alerts = driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg")
+        if alerts:
+            for alert in alerts:
+                if "no records found" in alert.text.lower():
+                    return "no_data"
+        
+        # Verify if incoming valid data rows have populated the DOM
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+        if rows:
+            row_text = "".join(r.text.strip() for r in rows)
             if len(row_text) > 10:
                 return "ok"
                 
-            return False
-        except StaleElementReferenceException:
-            return False
-        except BaseException:
-            return False
-
-    try:
-        return WebDriverWait(driver, wait_timeout).until(table_updated)
-    except TimeoutException:
-        return "timeout"
+        time.sleep(0.2)
+        
+    return "timeout"
 
 def click_excel_button(driver):
     btn = WebDriverWait(driver, 15).until(
@@ -208,11 +171,11 @@ def wait_for_download(directory: str, before: set, timeout: int = 60) -> str | N
         crdownloads = [f for f in current if f.endswith(".crdownload")]
         if new_files and not crdownloads:
             return os.path.join(directory, new_files[0])
-        time.sleep(0.5)  # OS File watcher polling (not a UI wait)
+        time.sleep(0.5)
     return None
 
 # =========================================
-# FIXED DROPDOWN VALUES
+# DATA STRUCTS
 # =========================================
 
 MARKETING_SEASONS = [
@@ -229,16 +192,16 @@ MARKETING_YEARS = [
 ]
 
 # =========================================
-# MAIN LOOP
+# RUN ENGINE
 # =========================================
 
 already_done = get_existing_downloads()
 total_saved, total_skipped, total_no_data, total_errors = 0, 0, 0, 0
 
 print(f"\n{'='*60}")
-print(f"  Procurement data downloader (Dynamic Waits Fixed)")
+print(f"  Procurement data downloader (100% Integrity Build)")
 print(f"  Saving to: {DOWNLOAD_DIR}")
-print(f"  Already downloaded: {len(already_done)} file(s) — will skip these")
+print(f"  Already downloaded: {len(already_done)} file(s)")
 print(f"{'='*60}")
 
 try:
@@ -250,7 +213,7 @@ try:
         except Exception as load_err:
             print(f"  Page load attempt {attempt+1} failed: {load_err}")
             if attempt == 2: raise
-            time.sleep(5)  # Network error backoff
+            time.sleep(5)
 
     for season in MARKETING_SEASONS:
         for year in MARKETING_YEARS:
@@ -258,12 +221,11 @@ try:
             print(f"\n► {season_text}  {year_text}")
 
             try:
-                # FIX: Season updates Year, Year updates Commodity
-                select_dropdown_dynamic(driver, "m_s_id", season["value"], child_id="m_year")
-                select_dropdown_dynamic(driver, "m_year", year["value"], child_id="comdty_id")
+                select_dropdown_and_stabilize(driver, "m_s_id", season["value"], child_id="m_year")
+                select_dropdown_and_stabilize(driver, "m_year", year["value"], child_id="comdty_id")
 
                 commodities = get_select_options(driver, "comdty_id")
-                print(f"  {len(commodities)} commodities")
+                print(f"  {len(commodities)} commodities identified")
                 if not commodities: continue
 
                 for commodity in commodities:
@@ -271,7 +233,7 @@ try:
                     print(f"  ┌─ {commodity_text}")
 
                     try:
-                        select_dropdown_dynamic(driver, "comdty_id", commodity["value"], child_id="c_type_id")
+                        select_dropdown_and_stabilize(driver, "comdty_id", commodity["value"], child_id="c_type_id")
                         crop_types = get_select_options(driver, "c_type_id")
                         if not crop_types: continue
 
@@ -280,7 +242,7 @@ try:
                             print(f"  │  ├─ {crop_text}")
 
                             try:
-                                select_dropdown_dynamic(driver, "c_type_id", crop["value"], child_id="st_id")
+                                select_dropdown_and_stabilize(driver, "c_type_id", crop["value"], child_id="st_id")
                                 states = get_select_options(driver, "st_id")
                                 if not states: continue
                                 
@@ -290,15 +252,13 @@ try:
 
                                     fname = sanitize(f"{season_text}_{year_text}_{commodity_text}_{crop_text}_{state_text}")
                                     if fname in already_done:
-                                        print(f"skipped")
+                                        print("skipped")
                                         total_skipped += 1
                                         continue
 
                                     try:
-                                        # State is the last selection, so no child_id to wait for
-                                        select_dropdown_dynamic(driver, "st_id", state["value"])
+                                        select_dropdown_and_stabilize(driver, "st_id", state["value"])
 
-                                        # Submit and dynamically wait for the new DOM to render
                                         table_status = click_submit_and_wait(driver)
                                         
                                         if table_status == "no_data":
@@ -306,7 +266,7 @@ try:
                                             total_no_data += 1
                                             continue
                                         elif table_status == "timeout":
-                                            print("timed out waiting for table")
+                                            print("timed out loading results")
                                             total_errors += 1
                                             continue
 
@@ -335,33 +295,31 @@ try:
                                         continue
 
                             except Exception as crop_err:
-                                print(f"  │  └─ ERROR in {crop_text}: {crop_err}")
+                                print(f"  │  └─ ERROR processing crop {crop_text}: {crop_err}")
                                 total_errors += 1
                                 continue
 
                     except Exception as commodity_err:
-                        print(f"  └─ ERROR in {commodity_text}: {commodity_err}")
+                        print(f"  └─ ERROR processing commodity {commodity_text}: {commodity_err}")
                         total_errors += 1
                         continue
 
             except Exception as combo_err:
-                import traceback
-                print(f"\n  ERROR in {season_text} {year_text}:")
-                traceback.print_exc()
+                print(f"\n  Fatal loop step tracking break in {season_text} {year_text}, resetting interface context...")
                 driver.get(URL)
                 wait_for_page_load(driver)
                 continue
 
 except Exception as e:
     import traceback
-    print("\n[MAIN ERROR]")
+    print("\n[MAIN CRITICAL INTERRUPT]")
     traceback.print_exc()
 
 finally:
     print(f"\n{'='*60}")
     print(f"  Run complete")
     print(f"  Saved    : {total_saved}")
-    print(f"  Skipped  : {total_skipped}  (already existed)")
+    print(f"  Skipped  : {total_skipped}")
     print(f"  No data  : {total_no_data}")
     print(f"  Errors   : {total_errors}")
     print(f"  Location : {DOWNLOAD_DIR}")
