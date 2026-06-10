@@ -43,7 +43,7 @@ driver.set_page_load_timeout(60)
 driver.set_script_timeout(30)
 
 # =========================================
-# HIGH-INTEGRITY DYNAMIC WAITS & HELPERS
+# NON-DESTRUCTIVE DYNAMIC WAITS & HELPERS
 # =========================================
 
 def sanitize(text: str) -> str:
@@ -81,8 +81,8 @@ def get_select_options(driver, select_id) -> list[dict]:
 
 def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeout=12):
     """
-    Selects a value, then watches the child element until its structure completely 
-    settles (stops modifying) for 400ms. Eliminates timeouts on identical datasets.
+    Selects a dropdown option, then samples the child element until its structure 
+    completely settles (stops rendering modifications) for 400ms.
     """
     parent_el = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.ID, parent_id))
@@ -107,7 +107,7 @@ def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeo
                 if stable_start is None:
                     stable_start = time.time()
                 elif time.time() - stable_start >= 0.4:
-                    return  # Form element layout has settled completely
+                    return
             else:
                 last_state = current_state
                 stable_start = None
@@ -118,40 +118,76 @@ def select_dropdown_and_stabilize(driver, parent_id, value, child_id=None, timeo
 
 def click_submit_and_wait(driver, wait_timeout=45):
     """
-    Purges old tables and alert structures via JavaScript before execution
-    to guarantee no ghost alerts cause false data-omission flags.
+    Monitors UI state transitions safely by tracking active element 
+    instances instead of mutating the underlying Angular framework DOM tree.
     """
-    driver.execute_script("""
-        var oldAlerts = document.querySelectorAll('.alert-danger-msg');
-        oldAlerts.forEach(function(el) { el.remove(); });
-        
-        var oldTable = document.querySelector('table tbody');
-        if (oldTable) { oldTable.innerHTML = ''; }
-    """)
+    # 1. Grab references to whatever elements are currently on the screen
+    old_alert_el = None
+    try:
+        old_alert_el = driver.find_element(By.CSS_SELECTOR, ".alert-danger-msg")
+    except NoSuchElementException:
+        pass
 
+    old_first_row_el = None
+    try:
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+        if rows:
+            old_first_row_el = rows[0]
+    except BaseException:
+        pass
+
+    # 2. Click the query submission button
     submit_btn = WebDriverWait(driver, 15).until(
         EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
     )
     driver.execute_script("arguments[0].click();", submit_btn)
 
+    # 3. Allow Angular a brief operational padding window to execute the request lifecycle
+    time.sleep(1.0)
+
+    # 4. Monitor state changes safely
     end_time = time.time() + wait_timeout
     while time.time() < end_time:
-        # Scan exclusively for the real-time danger container matching the provided spec
-        alerts = driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg")
-        if alerts:
-            for alert in alerts:
-                if "no records found" in alert.text.lower():
-                    return "no_data"
-        
-        # Verify if incoming valid data rows have populated the DOM
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        if rows:
-            row_text = "".join(r.text.strip() for r in rows)
-            if len(row_text) > 10:
-                return "ok"
-                
+        # Check if an alert message layout is actively displayed
+        try:
+            alerts = driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg")
+            if alerts:
+                current_alert = alerts[0]
+                if "no records found" in current_alert.text.lower():
+                    if old_alert_el is None:
+                        return "no_data"
+                    elif current_alert != old_alert_el:
+                        return "no_data"
+                    elif old_first_row_el:
+                        try:
+                            # If old table data elements throw stale, the container refreshed
+                            _ = old_first_row_el.text
+                        except StaleElementReferenceException:
+                            return "no_data"
+        except BaseException:
+            pass
+
+        # Check if valid grid rows are loaded in the view
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+            if rows:
+                current_first_row = rows[0]
+                if old_first_row_el is None:
+                    if len(current_first_row.text.strip()) > 2:
+                        return "ok"
+                elif current_first_row != old_first_row_el:
+                    if len(current_first_row.text.strip()) > 2:
+                        return "ok"
+                else:
+                    try:
+                        _ = old_first_row_el.text
+                    except StaleElementReferenceException:
+                        return "ok"
+        except BaseException:
+            pass
+
         time.sleep(0.2)
-        
+
     return "timeout"
 
 def click_excel_button(driver):
@@ -175,7 +211,7 @@ def wait_for_download(directory: str, before: set, timeout: int = 60) -> str | N
     return None
 
 # =========================================
-# DATA STRUCTS
+# DATA SEED STRUCTS
 # =========================================
 
 MARKETING_SEASONS = [
@@ -192,14 +228,14 @@ MARKETING_YEARS = [
 ]
 
 # =========================================
-# RUN ENGINE
+# RUN ENGINE LOOP
 # =========================================
 
 already_done = get_existing_downloads()
 total_saved, total_skipped, total_no_data, total_errors = 0, 0, 0, 0
 
 print(f"\n{'='*60}")
-print(f"  Procurement data downloader (100% Integrity Build)")
+print(f"  Procurement data downloader (High Integrity Lifecycle Build)")
 print(f"  Saving to: {DOWNLOAD_DIR}")
 print(f"  Already downloaded: {len(already_done)} file(s)")
 print(f"{'='*60}")
@@ -305,14 +341,14 @@ try:
                         continue
 
             except Exception as combo_err:
-                print(f"\n  Fatal loop step tracking break in {season_text} {year_text}, resetting interface context...")
+                print(f"\n  Loop contextual alignment sync tracking break in {season_text} {year_text}, re-routing session workflow...")
                 driver.get(URL)
                 wait_for_page_load(driver)
                 continue
 
 except Exception as e:
     import traceback
-    print("\n[MAIN CRITICAL INTERRUPT]")
+    print("\n[CRITICAL RUN INTERRUPTION]")
     traceback.print_exc()
 
 finally:
