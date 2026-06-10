@@ -317,6 +317,15 @@ def click_submit_get_result(driver, expected_state_name: str) -> str:
     Click Submit and wait for a fresh, confirmed result for `expected_state_name`.
 
     Returns: "ok" | "no_data" | "timeout" | "sig_mismatch"
+
+    CRITICAL: The no-data alert (.alert-danger-msg) persists in the DOM from
+    the previous combination. We must NEVER check it before the result signature
+    has changed — otherwise we get an instant false "no_data" from stale DOM.
+    Order of operations:
+      1. Record pre-submit signature.
+      2. Click submit.
+      3. Wait for signature to CHANGE  ← proves Angular processed this submit.
+      4. Only THEN check alert OR table rows.
     """
     pre_sig = _get_result_signature(driver)
 
@@ -329,8 +338,28 @@ def click_submit_get_result(driver, expected_state_name: str) -> str:
         return f"submit_error:{e}"
 
     end = time.time() + SUBMIT_TIMEOUT
+    sig_changed = False
+
     while time.time() < end:
-        # Check for no-data alert
+        # ── Phase 1: wait for signature to change ───────────────────────────
+        # Do NOT check alert here — it may be stale from previous combo.
+        if not sig_changed:
+            try:
+                sig = _get_result_signature(driver)
+                if sig and sig != pre_sig:
+                    sig_changed = True
+                    log.debug(f"    sig changed → {sig!r}")
+                    # Validate this result is for the right state
+                    if expected_state_name.lower() not in sig.lower():
+                        log.warning(f"    sig_mismatch: expected {expected_state_name!r} not in {sig!r}")
+                        return "sig_mismatch"
+            except Exception:
+                pass
+            time.sleep(0.25)
+            continue
+
+        # ── Phase 2: sig changed and name matched — now check outcome ────────
+        # Check no-data alert (safe now — Angular has rendered this combo's result)
         try:
             for alert in driver.find_elements(By.CSS_SELECTOR, ".alert-danger-msg"):
                 if alert.is_displayed() and "no records found" in alert.text.lower():
@@ -338,20 +367,11 @@ def click_submit_get_result(driver, expected_state_name: str) -> str:
         except Exception:
             pass
 
-        # Check for fresh result
-        try:
-            sig = _get_result_signature(driver)
-            if sig and sig != pre_sig:
-                if expected_state_name.lower() in sig.lower():
-                    if _table_has_data_rows(driver):
-                        return "ok"
-                    # sig changed, name matches, but rows not yet rendered
-                else:
-                    log.warning(f"    sig_mismatch: expected {expected_state_name!r} not in {sig!r}")
-                    return "sig_mismatch"
-        except Exception:
-            pass
+        # Check for table data rows
+        if _table_has_data_rows(driver):
+            return "ok"
 
+        # sig changed and name matched, but neither alert nor rows yet — keep polling
         time.sleep(0.25)
 
     return "timeout"
@@ -407,6 +427,11 @@ def process_combination(
     if status != "ok":
         return f"timeout_or_error:{status}"
 
+    # Wait for the table to fully render before triggering the download.
+    # The Excel export reads from the Angular component's in-memory data —
+    # if clicked too early, it exports a partial or empty dataset.
+    time.sleep(5)
+
     before = set(os.listdir(DOWNLOAD_DIR))
     try:
         xl_btn = WebDriverWait(driver, 15).until(
@@ -459,7 +484,7 @@ def main():
     total_saved = total_skipped = total_no_data = total_errors = 0
 
     log.info("=" * 60)
-    log.info("  Procurement Scraper — v6")
+    log.info("  Procurement Scraper — v6.1")
     log.info(f"  Destination : {DOWNLOAD_DIR}")
     log.info(f"  Already done: {len(already_done)} files")
     log.info("=" * 60)
